@@ -1,0 +1,232 @@
+import { Button, ProgressIndicator, ListView, Palette } from "std-widgets.slint";
+
+export struct TreeRow {
+    path: string,
+    name: string,
+    detail: string,
+    size-text: string,
+    depth: int,
+    expandable: bool,
+    expanded: bool,
+    selected: bool,
+    protected: bool,
+    removable: bool,
+}
+
+// Seta de expandir/colapsar desenhada como vetor, não como glifo Unicode.
+// `▸`/`▾` (U+25B8/U+25BE) moram no Segoe UI Symbol, não no Segoe UI base, e
+// o fallback de fonte do renderer do Slint não os alcança — apareciam como
+// quadrado de tofu. Path não depende de fonte nenhuma.
+component ExpandArrow inherits Path {
+    in property <bool> expanded: false;
+    width: 9px;
+    height: 9px;
+    viewbox-width: 10;
+    viewbox-height: 10;
+    // Fechada aponta para a direita; aberta aponta para baixo.
+    commands: expanded ? "M 1 3 L 9 3 L 5 8 Z" : "M 3 1 L 8 5 L 3 9 Z";
+}
+
+// Mesmo motivo: `✓` (U+2713) não está no Segoe UI base.
+component CheckMark inherits Path {
+    width: 12px;
+    height: 12px;
+    viewbox-width: 12;
+    viewbox-height: 12;
+    commands: "M 1.5 6 L 4.5 9 L 10.5 2.5";
+    stroke-width: 2px;
+    stroke-line-cap: round;
+    stroke-line-join: round;
+}
+
+export component AppWindow inherits Window {
+    title: "Folder Sweep";
+    icon: @image-url("app-icon.png");
+    background: Palette.background;
+
+    // Tamanho inicial enxuto, mas redimensionável: a árvore estica para
+    // ocupar o que sobrar (`vertical-stretch` abaixo), então aumentar a
+    // janela mostra mais linhas em vez de só folga vazia.
+    preferred-width: 480px;
+    preferred-height: 400px;
+    min-width: 400px;
+    min-height: 300px;
+
+    in property <[TreeRow]> rows: [];
+    in property <int> selected-count: 0;
+    in property <bool> running: false;
+    in property <bool> finished: false;
+    in property <int> scanned-count: 0;
+    in property <int> deleted-count: 0;
+    in property <int> error-count: 0;
+    in property <string> elapsed-text: "0:00";
+    in property <string> current-path: "";
+    in property <string> empty-message: "Nenhum disco encontrado.";
+
+    callback start();
+    callback cancel();
+    callback toggle-expand(int);
+    callback toggle-select(int);
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+
+        Text {
+            text: "Marque os caminhos que quer limpar";
+            font-weight: 600;
+            color: Palette.foreground;
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            min-height: 120px;
+            border-width: 1px;
+            border-color: Palette.border;
+            background: Palette.control-background;
+
+            if rows.length == 0: Text {
+                text: empty-message;
+                x: 8px;
+                y: 8px;
+                color: Palette.foreground.transparentize(0.4);
+            }
+
+            ListView {
+                for row[i] in rows: Rectangle {
+                    height: 26px;
+                    background: row.selected
+                        ? Palette.accent-background.transparentize(0.75)
+                        : transparent;
+
+                    // Primeiro filho, portanto abaixo de tudo: clique em
+                    // qualquer lugar vazio da linha alterna a seleção. A
+                    // TouchArea da seta vem depois na árvore e fica por cima,
+                    // então expandir não seleciona por acidente.
+                    TouchArea {
+                        enabled: !running && !row.protected;
+                        clicked => { toggle-select(i); }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 6px;
+                        padding-right: 6px;
+                        spacing: 6px;
+
+                        // Indentação com teto. Sem o clamp, profundidade 10
+                        // na largura mínima consome 160px e espreme a coluna
+                        // de nome até zero — o usuário deixaria de saber a
+                        // qual pasta a linha se refere, num app que apaga
+                        // permanentemente o que está marcado.
+                        Rectangle { width: min(row.depth, 6) * 14px; }
+
+                        Rectangle {
+                            width: 18px;
+                            if row.expandable: ExpandArrow {
+                                expanded: row.expanded;
+                                fill: Palette.foreground.transparentize(0.35);
+                            }
+                            TouchArea {
+                                enabled: !running && row.expandable;
+                                clicked => { toggle-expand(i); }
+                            }
+                        }
+
+                        Rectangle {
+                            width: 14px;
+                            if row.selected: CheckMark {
+                                stroke: Palette.accent-background;
+                            }
+                        }
+
+                        Text {
+                            text: row.name;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                            color: row.protected
+                                ? Palette.foreground.transparentize(0.55)
+                                : Palette.foreground;
+                            vertical-alignment: center;
+                        }
+
+                        Text {
+                            text: row.detail;
+                            min-width: 64px;
+                            overflow: elide;
+                            color: Palette.foreground.transparentize(0.35);
+                            vertical-alignment: center;
+                        }
+
+                        Text {
+                            text: row.protected
+                                ? "protegido"
+                                : (row.removable ? "removível" : "");
+                            min-width: 66px;
+                            overflow: elide;
+                            color: Palette.foreground.transparentize(0.45);
+                            vertical-alignment: center;
+                        }
+
+                        Text {
+                            text: row.size-text;
+                            min-width: 52px;
+                            color: Palette.foreground.transparentize(0.35);
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+
+        Text {
+            text: selected-count == 0
+                ? "Nenhum caminho marcado"
+                : selected-count + (selected-count == 1 ? " caminho marcado" : " caminhos marcados");
+            font-size: 12px;
+            color: Palette.foreground.transparentize(0.35);
+        }
+
+        HorizontalLayout {
+            spacing: 10px;
+            Button {
+                text: "Iniciar";
+                enabled: !running && selected-count > 0;
+                clicked => { start(); }
+            }
+            Button {
+                text: "Cancelar";
+                enabled: running;
+                clicked => { cancel(); }
+            }
+        }
+
+        ProgressIndicator {
+            indeterminate: running;
+            height: 6px;
+        }
+
+        // Linha 1: contadores + tempo decorrido. A condição olha `finished`,
+        // não `scanned-count`: uma corrida que analisou zero pastas ainda
+        // precisa mostrar o resumo.
+        Text {
+            text: !running && !finished
+                ? ""
+                : (running ? "" : "Concluído · ")
+                    + scanned-count + " analisadas · "
+                    + deleted-count + " apagadas · "
+                    + error-count + " erros · "
+                    + elapsed-text;
+            font-size: 12px;
+            color: Palette.foreground.transparentize(0.25);
+            overflow: elide;
+        }
+
+        // Linha 2: pasta sendo verificada agora.
+        Text {
+            text: current-path;
+            font-size: 12px;
+            color: Palette.foreground.transparentize(0.45);
+            overflow: elide;
+        }
+    }
+}

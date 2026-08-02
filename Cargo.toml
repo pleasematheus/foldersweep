@@ -1,0 +1,21 @@
+[package]
+name = "foldersweep"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+slint = "1.17.1"
+sysinfo = "0.39.6"
+dirs = "6.0.0"
+
+[build-dependencies]
+slint-build = "1.17.1"
+winresource = "0.1.31"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
