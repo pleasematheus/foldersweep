@@ -44,13 +44,18 @@ export component AppWindow inherits Window {
     icon: @image-url("app-icon.png");
     background: Palette.background;
 
-    // Tamanho inicial enxuto, mas redimensionável: a árvore estica para
-    // ocupar o que sobrar (`vertical-stretch` abaixo), então aumentar a
-    // janela mostra mais linhas em vez de só folga vazia.
-    preferred-width: 480px;
-    preferred-height: 400px;
-    min-width: 400px;
-    min-height: 300px;
+    // Tamanho travado. O backend do Slint decide a redimensionabilidade por
+    // `min_w < max_w || min_h < max_h`; com min == max nos dois eixos a
+    // janela fica fixa, e o mesmo booleano desabilita o botão de maximizar
+    // (`buttons.set(WindowButtons::MAXIMIZE, resizable)`). Não há controle
+    // separado para o botão — travar o tamanho é o que o desliga.
+    //
+    // A árvore mantém `vertical-stretch` mesmo assim: ela distribui a sobra
+    // fixa para a lista em vez de deixar um vão morto no fim do layout.
+    min-width: 480px;
+    max-width: 480px;
+    min-height: 400px;
+    max-height: 400px;
 
     in property <[TreeRow]> rows: [];
     in property <int> selected-count: 0;

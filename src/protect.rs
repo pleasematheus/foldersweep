@@ -86,15 +86,44 @@ fn known_folders() -> Vec<PathBuf> {
 /// relocada e Windows-To-Go colocam o SO noutra letra. Com `C:\Windows`
 /// fixo, marcar esse outro disco na árvore faria a varredura descer no SO
 /// e apagar diretórios vazios que instaladores e o servicing esperam.
+/// Falha fechada: o conjunto é a **união** do ambiente com os caminhos
+/// clássicos em `C:`. Só o ambiente falharia aberto — se `SystemRoot` viesse
+/// vazio ou ausente (ambiente enxuto, processo lançado por um serviço, env
+/// adulterado), a classe B simplesmente não cobriria o diretório do Windows
+/// e a varredura desceria nele em silêncio. Só o hardcoded falharia aberto
+/// na máquina com Windows noutra letra. A união nunca protege de menos.
 fn system_roots() -> &'static [PathBuf] {
     static ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
     ROOTS.get_or_init(|| {
-        ["SystemRoot", "windir", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData"]
+        const FROM_ENV: &[&str] = &[
+            "SystemRoot",
+            "windir",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "ProgramW6432",
+            "ProgramData",
+        ];
+        const FALLBACK: &[&str] = &[
+            r"C:\Windows",
+            r"C:\Program Files",
+            r"C:\Program Files (x86)",
+            r"C:\ProgramData",
+        ];
+
+        let mut roots: Vec<PathBuf> = FROM_ENV
             .iter()
             .filter_map(|key| std::env::var_os(key))
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty())
-            .collect()
+            .collect();
+
+        for path in FALLBACK {
+            let path = PathBuf::from(path);
+            if !roots.iter().any(|r| fold(r) == fold(&path)) {
+                roots.push(path);
+            }
+        }
+        roots
     })
 }
 
@@ -116,10 +145,7 @@ pub fn is_subtree_protected(path: &Path) -> bool {
         return true;
     }
 
-    if system_roots()
-        .iter()
-        .any(|root| starts_with_ci(path, root))
-    {
+    if system_roots().iter().any(|root| starts_with_ci(path, root)) {
         return true;
     }
 
@@ -203,7 +229,9 @@ mod tests {
             .or_else(|| std::env::var_os("windir"))
             .map(PathBuf::from)
             .expect("SystemRoot definido no Windows");
-        assert!(is_subtree_protected(&windir.join("System32").join("config")));
+        assert!(is_subtree_protected(
+            &windir.join("System32").join("config")
+        ));
     }
 
     #[test]
@@ -222,6 +250,19 @@ mod tests {
         assert!(!is_subtree_protected(&sibling.join("config")));
 
         assert!(!is_subtree_protected(Path::new(r"D:\Projetos\Windows")));
+    }
+
+    #[test]
+    fn classic_c_paths_stay_protected_even_if_environment_is_stripped() {
+        // A união com os caminhos clássicos existe para falhar fechada: sem
+        // ela, um ambiente sem SystemRoot deixaria o diretório do Windows
+        // descoberto sem nenhum sinal.
+        assert!(is_subtree_protected(Path::new(r"C:\Windows\System32")));
+        assert!(is_subtree_protected(Path::new(r"C:\Program Files\App")));
+        assert!(is_subtree_protected(Path::new(r"C:\ProgramData\App")));
+        assert!(!is_subtree_protected(Path::new(
+            r"C:\Users\alguem\Projetos"
+        )));
     }
 
     #[test]

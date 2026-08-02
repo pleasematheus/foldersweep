@@ -307,6 +307,24 @@ Agora `preferred` 480×400 e `min` 400×300, com a árvore em `vertical-stretch:
 
 As colunas fixas precisaram encolher junto (detail 90→64, status 70→66, tamanho 60→52). Na largura antiga sobrava espaço; em 400px elas engoliriam a coluna de nome, que é a que tem `horizontal-stretch` e carrega a informação. Altura de linha 30→26 e padding/spacing 16/10→12/8 pela mesma razão: em janela pequena, densidade é legibilidade.
 
+### D13b — Janela de tamanho fixo
+
+Substitui a parte redimensionável de D13. A janela agora é travada em 480×400.
+
+O Slint não expõe controle do botão de maximizar. O backend winit deriva tudo de uma comparação só:
+
+```rust
+let resizable = window_is_resizable(min, max);   // min_w < max_w || min_h < max_h
+winit_window.set_resizable(resizable);
+buttons.set(WindowButtons::MAXIMIZE, resizable); // mesmo booleano
+```
+
+Com `min == max` nos dois eixos, `resizable` é falso e o botão de maximizar é desabilitado junto. Não dá para separar os dois pela API do Slint — manter redimensionável e tirar só o maximizar exigiria pegar o `HWND` via `window_handle()` e limpar `WS_MAXIMIZEBOX` com `SetWindowLongPtrW`, o que custaria uma dependência (`windows-sys`) e um bloco `unsafe` por uma questão de janela.
+
+A árvore mantém `vertical-stretch: 1` mesmo com altura fixa: ela absorve a sobra do layout em vez de deixar um vão morto no fim. Com 480×400 sobram ~225px para a lista, ~8 linhas visíveis.
+
+**Consequência:** o número de linhas visíveis virou decisão de projeto, não do usuário — ele não pode mais aumentar a janela para ver mais. Se 8 linhas apertar na navegação de árvores profundas, o ajuste é subir a altura fixa, não devolver o resize.
+
 ### D14 — Raízes de sistema vêm do ambiente
 
 `C:\Windows` hardcoded era o furo mais sério da lista de proteção, e passava despercebido porque a máquina de desenvolvimento tem o Windows em C:.
@@ -322,6 +340,20 @@ Agora sai de `SystemRoot`, `windir`, `ProgramFiles`, `ProgramFiles(x86)`, `Progr
 Não coberto: nomes curtos 8.3 (`C:\Users\MATHEU~1`), `subst` e forma UNC vs. letra. `canonicalize()` resolveria, mas devolve caminhos com prefixo `\\?\` que quebrariam as comparações de prefixo, e custaria uma syscall por checagem no caminho quente. Fica anotado.
 
 **Um stat por diretório a menos.** `is_subtree_protected` tinha um ramo de reparse point que nunca disparava: os dois call sites já filtram `is_symlink()` antes, e no Windows `is_dir()` é falso para symlink. Custava um `symlink_metadata` por diretório visitado — numa varredura de `C:\`, milhões de syscalls por um `if` morto. Removido, com o contrato de pré-filtragem documentado na própria função.
+
+### D15 — Travessia iterativa, pilha no heap
+
+A recursão por diretório transformava profundidade de árvore em profundidade de pilha. Com long paths habilitado o NTFS aceita ~32k caracteres de caminho, e cada quadro carregava dois `WIN32_FIND_DATAW` (~600 bytes cada, um no `ReadDir` e um no `DirEntry`) — alguns milhares de níveis chegam nos 2 MiB da worker. Estouro de pilha em Rust é abort imediato, sem unwinding: mataria o processo no meio da varredura.
+
+Sem impacto de integridade — cada remoção é uma syscall atômica e independente, então morrer no meio não deixa estado parcial. Impacto é de disponibilidade. Mas é uma classe inteira que sai de graça trocando a pilha da thread por um `Vec<Frame>` no heap.
+
+**Dois detalhes que a conversão não podia perder:**
+
+O `Frame` guarda o `ReadDir`, não um `Vec` dos filhos. Materializar as entradas fecharia o handle mais cedo, mas um diretório com centenas de milhares de filhos viraria uma alocação de uma vez só. Um handle por nível é exatamente o que a versão recursiva já fazia.
+
+Quando `read_dir` falha num filho, a versão recursiva contava o erro e **ainda assim tentava remover**, porque a chamada retornava e o laço do pai seguia para o `remove_dir`. Uma pasta pode estar vazia e sem permissão de leitura. A versão iterativa replica isso chamando `finish_directory` no ramo de erro do descenso — fácil de perder na conversão e silencioso se perdido.
+
+A raiz continua nunca sendo removida: ela sai da pilha sem ninguém abaixo para chamar `finish_directory`.
 
 ## Risks / Trade-offs
 

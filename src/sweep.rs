@@ -104,34 +104,71 @@ struct Walker<'a, F: FnMut(SweepStats, &Path, Duration)> {
     on_progress: F,
 }
 
-impl<F: FnMut(SweepStats, &Path, Duration)> Walker<'_, F> {
-    /// Post-order manual (não `WalkDir::contents_first`): a combinação
-    /// `contents_first` + `filter_entry` do walkdir 2.5 corrompe o walk —
-    /// `skip_current_dir` faz pop() na pilha atual, que em modo pós-ordem
-    /// pode já pertencer a um diretório-irmão não relacionado ao rejeitado
-    /// (documentado como "no different than Iterator::filter", mas na
-    /// prática o pop() indevido quebra entradas seguintes). Recursão manual
-    /// evita o bug e elimina a dependência do `walkdir`.
-    fn walk(&mut self, dir: &Path) {
-        if self.cancel.load(Ordering::Relaxed) {
-            return;
-        }
+/// Um diretório aberto na pilha de travessia.
+///
+/// Guarda o `ReadDir` em vez de materializar os filhos num `Vec`: um
+/// diretório com centenas de milhares de entradas não vira alocação de uma
+/// vez só. É o mesmo que a versão recursiva fazia, um handle por nível.
+struct Frame {
+    path: PathBuf,
+    entries: std::fs::ReadDir,
+}
 
-        let entries = match std::fs::read_dir(dir) {
-            Ok(it) => it,
+impl<F: FnMut(SweepStats, &Path, Duration)> Walker<'_, F> {
+    /// Pós-ordem iterativo, com pilha explícita no heap.
+    ///
+    /// Não é `WalkDir::contents_first`: a combinação `contents_first` +
+    /// `filter_entry` do walkdir 2.5 corrompe o walk — `skip_current_dir`
+    /// faz pop() na pilha de leitura atual, que em modo pós-ordem pode já
+    /// pertencer a um diretório-irmão não relacionado ao rejeitado.
+    ///
+    /// E não é recursivo: recursão por diretório transforma profundidade de
+    /// árvore em profundidade de pilha. Com long paths, o NTFS aceita ~32k
+    /// caracteres de caminho, e cada quadro carrega dois `WIN32_FIND_DATAW`
+    /// (~600 bytes cada), então alguns milhares de níveis estouram os 2 MiB
+    /// da worker. Estouro de pilha em Rust é abort imediato, sem unwinding.
+    /// Não corromperia nada — cada remoção é atômica e independente — mas
+    /// mataria o processo no meio da varredura. Com a pilha no heap, a
+    /// profundidade passa a custar só memória.
+    fn walk(&mut self, root: &Path) {
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
             Err(_) => {
                 self.stats.errors += 1;
                 return;
             }
         };
+        let mut stack = vec![Frame {
+            path: root.to_path_buf(),
+            entries,
+        }];
 
-        for entry in entries {
+        while !stack.is_empty() {
             if self.cancel.load(Ordering::Relaxed) {
                 return;
             }
 
+            // Borrow escopado a esta linha só, para a pilha ficar livre para
+            // push/pop no resto do corpo.
+            let next = stack
+                .last_mut()
+                .expect("pilha não vazia: verificado na condição do while")
+                .entries
+                .next();
+
+            let Some(entry) = next else {
+                // Diretório esgotado: os filhos já foram tratados, agora é a
+                // vez dele. A raiz não é removida — ela sai da pilha sem
+                // ninguém abaixo para chamar `finish_directory`.
+                let done = stack.pop().expect("pilha não vazia");
+                if !stack.is_empty() {
+                    self.finish_directory(&done.path);
+                }
+                continue;
+            };
+
             let entry = match entry {
-                Ok(e) => e,
+                Ok(entry) => entry,
                 Err(_) => {
                     self.stats.errors += 1;
                     continue;
@@ -140,7 +177,7 @@ impl<F: FnMut(SweepStats, &Path, Duration)> Walker<'_, F> {
             let path = entry.path();
 
             let file_type = match entry.file_type() {
-                Ok(t) => t,
+                Ok(file_type) => file_type,
                 Err(_) => {
                     self.stats.errors += 1;
                     continue;
@@ -163,30 +200,38 @@ impl<F: FnMut(SweepStats, &Path, Duration)> Walker<'_, F> {
                 continue;
             }
 
-            self.walk(&path);
-
-            if self.cancel.load(Ordering::Relaxed) {
-                return;
-            }
-
-            // Classe A: varre por dentro (já fez acima), nunca remove ela mesma.
-            if !self.guard.is_protected(&path) {
-                match std::fs::remove_dir(&path) {
-                    Ok(()) => self.stats.deleted += 1,
-                    Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
-                    Err(_) => self.stats.errors += 1,
+            match std::fs::read_dir(&path) {
+                Ok(entries) => stack.push(Frame { path, entries }),
+                Err(_) => {
+                    // Ilegível. Conta o erro e mesmo assim tenta remover, que
+                    // é o que a versão recursiva fazia ao retornar da chamada:
+                    // uma pasta pode estar vazia e sem permissão de leitura.
+                    self.stats.errors += 1;
+                    self.finish_directory(&path);
                 }
             }
+        }
+    }
 
-            // ponytail: o relógio só avança quando o walk emite progresso, então
-            // um read_dir muito lento congela o contador de tempo por alguns
-            // segundos (a barra indeterminada continua animando, então o sinal
-            // de "não travei" sobrevive). Se isso incomodar na prática, trocar
-            // por um slint::Timer na thread de UI.
-            if self.last_report.elapsed() >= self.throttle {
-                (self.on_progress)(self.stats, &path, self.started.elapsed());
-                self.last_report = Instant::now();
+    /// Chamado quando um diretório já teve todo o conteúdo tratado.
+    fn finish_directory(&mut self, path: &Path) {
+        // Classe A: varre por dentro (já foi feito), nunca remove ela mesma.
+        if !self.guard.is_protected(path) {
+            match std::fs::remove_dir(path) {
+                Ok(()) => self.stats.deleted += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                Err(_) => self.stats.errors += 1,
             }
+        }
+
+        // ponytail: o relógio só avança quando o walk emite progresso, então
+        // um read_dir muito lento congela o contador de tempo por alguns
+        // segundos (a barra indeterminada continua animando, então o sinal
+        // de "não travei" sobrevive). Se isso incomodar na prática, trocar
+        // por um slint::Timer na thread de UI.
+        if self.last_report.elapsed() >= self.throttle {
+            (self.on_progress)(self.stats, path, self.started.elapsed());
+            self.last_report = Instant::now();
         }
     }
 }
@@ -360,6 +405,36 @@ mod tests {
         assert!(root.exists());
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn deep_nesting_does_not_exhaust_the_stack() {
+        let root = temp_root("profunda");
+        // Prefixo verbatim: sem ele o Windows corta em MAX_PATH (260) e a
+        // árvore não chegaria fundo o bastante para o teste significar algo.
+        let deep_root = PathBuf::from(format!(r"\\?\{}", root.display()));
+
+        const DEPTH: usize = 1500;
+        let mut path = deep_root.clone();
+        for _ in 0..DEPTH {
+            path.push("d");
+        }
+        fs::create_dir_all(&path).unwrap();
+
+        let guard = ExactGuard::with_paths([]);
+        let cancel = AtomicBool::new(false);
+        let roots = [deep_root.clone()];
+        let stats = sweep_with_guard(&roots, &guard, &cancel, Duration::ZERO, |_, _, _| {});
+
+        // Cascata inteira numa passada, sem estourar a pilha. Com quadros
+        // recursivos (~1,2 KB cada por causa dos dois WIN32_FIND_DATAW),
+        // 1500 níveis ficam na borda dos 2 MiB da thread.
+        assert_eq!(stats.deleted, DEPTH as u64);
+        assert_eq!(stats.errors, 0);
+        assert!(!deep_root.join("d").exists());
+        assert!(root.exists(), "a raiz nunca é removida");
+
+        fs::remove_dir_all(&deep_root).ok();
     }
 
     #[test]

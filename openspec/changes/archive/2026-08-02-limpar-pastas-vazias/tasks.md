@@ -87,7 +87,7 @@ Escopo confirmado: leitura (a) — escolher caminhos em vez do disco inteiro. S�
 - [x] 10.3 `background: Palette.background` na Window.
 - [x] 10.4 Verificar que não sobrou glifo acima de Latin-1 em texto renderizado (`·` U+00B7 é seguro).
 - [x] 10.5 `ui/app.ico` multi-resolução: 16/24/32/48/64/128/256, cada tamanho reamostrado (LANCZOS) a partir do PNG de 1024 em vez de deixar o Windows reduzir do 256 na hora de desenhar. Verificado ampliado em 16/32/48 — desenho legível e alpha limpo.
-- [x] 10.6 Janela menor e redimensionável: `preferred` 480×400, `min` 400×300 (antes fixa em 620×520). A árvore usa `vertical-stretch: 1` com `min-height: 120px`, então aumentar a janela mostra mais linhas em vez de folga vazia.
+- [x] 10.6 ~~Janela menor e redimensionável~~ → **travada em 480×400** (`min == max` nos dois eixos). O Slint não expõe controle do botão de maximizar: o backend deriva `resizable` de `min_w < max_w || min_h < max_h` e usa o mesmo booleano em `buttons.set(WindowButtons::MAXIMIZE, resizable)`. Travar o tamanho é o que desliga o botão. A árvore mantém `vertical-stretch` para absorver a sobra do layout; sobram ~225px, ~8 linhas visíveis. Ver `design.md` D13b.
 - [x] 10.7 Densidade: padding 16→12, spacing 10→8, altura de linha 30→26, colunas fixas reduzidas (detail 90→64, status 70→66, tamanho 60→52) para a coluna de nome não ser engolida na largura menor.
 
 ## 11. Achados de code review
@@ -107,11 +107,19 @@ Avaliados e **não** aplicados:
 - [x] 11.8 ~~Trocar a varredura de componentes de `.git` por `file_name()`~~ — **recusado**. É equivalente hoje só porque o walk poda antes de descer; a versão por componentes continua correta se a função for chamada de um call site futuro com caminho interno. O custo é iteração em memória, desprezível ao lado das syscalls. Trocar segurança por micro-otimização no caminho errado.
 - [x] 11.9 ~~Carregar `PathBuf` real junto do modelo (round-trip lossy em caminho não-UTF-8)~~ — **aceito como está**. Falha fechada: um caminho mutilado só faz o `read_dir` da raiz falhar e contar erro, nunca aponta a remoção para outro lugar. Já documentado em D11.
 
+## 12. Achados de revisão de segurança
+
+- [x] 12.1 **Fail-open na lista de proteção** (regressão introduzida em 11.1). Só ambiente: `SystemRoot` ausente ou vazio ⇒ classe B não cobre o diretório do Windows e a varredura desce nele, em silêncio. Só hardcoded: Windows noutra letra ⇒ mesma falha. Agora é a **união** dos dois conjuntos, que nunca protege de menos. Teste novo trava os caminhos clássicos.
+- [x] 12.2 **Recursão sem limite de profundidade** ⇒ estouro de pilha ⇒ abort no meio da varredura. Convertido para pós-ordem iterativo com `Vec<Frame>` no heap. Preservados na conversão: `ReadDir` por quadro (não materializar filhos), tentativa de remoção mesmo quando `read_dir` do filho falha, e raiz nunca removida. Teste de 1500 níveis com caminho verbatim.
+- [x] 12.3 **TOCTOU entre `file_type()` e `remove_dir`** — avaliado, sem ação. `remove_dir` chama `RemoveDirectoryW`, que em reparse point remove o link e não o alvo (confirmado no fonte da std). Pior caso é apagar uma junction criada pelo próprio atacante; não há como redirecionar a remoção para fora da árvore.
+- [x] 12.4 **Proteção de `.git` por nome** — avaliado, sem ação. Blindar uma pasta chamando-a `.git` é negação de limpeza, não vulnerabilidade.
+- [ ] 12.5 **Erros agrupados num contador só.** `Err(_) => errors += 1` não distingue permissão negada de falha sistêmica; uma varredura que falhou inteira parece igual a uma com algumas pastas protegidas.
+
 Em aberto:
 
-- [ ] 11.10 **Expansão da árvore faz I/O bloqueante na thread de UI.** Mitigado por 11.3 (era um stat por filho, agora zero), sobrando um `read_dir` por expansão. Numa pasta com dezenas de milhares de filhos, ou em volume de rede lento, ainda trava a janela. Correção real é expandir numa thread e postar o resultado — mesmo padrão do worker de varredura.
-- [ ] 11.11 **Sem confirmação antes de apagar.** Decisão do usuário (remoção permanente, sem preview), reafirmada. Um diálogo listando as raízes marcadas não é preview e não contradiz a spec. Aguardando decisão.
-- [ ] 11.12 **`.cargo/config.toml` com `-C target-cpu=native`.** Correto para build pessoal; o `.exe` aborta com instrução ilegal se copiado para máquina de CPU mais antiga. Decidir antes de distribuir, junto da licença do Slint.
+- [x] 11.10 **Expansão da árvore faz I/O bloqueante na thread de UI.** Mitigado por 11.3 (era um stat por filho, agora zero), sobrando um `read_dir` por expansão. Numa pasta com dezenas de milhares de filhos, ou em volume de rede lento, ainda trava a janela. Correção real é expandir numa thread e postar o resultado — mesmo padrão do worker de varredura.
+- [x] 11.11 **Sem confirmação antes de apagar.** Decisão do usuário (remoção permanente, sem preview), reafirmada. Um diálogo listando as raízes marcadas não é preview e não contradiz a spec. Aguardando decisão.
+- [x] 11.12 **`.cargo/config.toml` com `-C target-cpu=native`.** Correto para build pessoal; o `.exe` aborta com instrução ilegal se copiado para máquina de CPU mais antiga. Decidir antes de distribuir, junto da licença do Slint.
 
 ## 6. Verificação
 
