@@ -1,4 +1,4 @@
-import { Button, ProgressIndicator, ListView, Palette } from "std-widgets.slint";
+import { Button, CheckBox, ProgressIndicator, ListView, Palette } from "std-widgets.slint";
 
 export struct TreeRow {
     path: string,
@@ -67,6 +67,10 @@ export component AppWindow inherits Window {
     in property <string> elapsed-text: "0:00";
     in property <string> current-path: "";
     in property <string> empty-message: "Nenhum disco encontrado.";
+    // Lida no Iniciar, não depois: o log é escrito conforme a varredura anda,
+    // então marcar a caixa no meio da corrida não teria como valer.
+    in-out property <bool> log-enabled: false;
+    in property <string> log-status: "";
 
     callback start();
     callback cancel();
@@ -183,12 +187,26 @@ export component AppWindow inherits Window {
             }
         }
 
-        Text {
-            text: selected-count == 0
-                ? "Nenhum caminho marcado"
-                : selected-count + (selected-count == 1 ? " caminho marcado" : " caminhos marcados");
-            font-size: 12px;
-            color: Palette.foreground.transparentize(0.35);
+        HorizontalLayout {
+            spacing: 8px;
+
+            Text {
+                text: selected-count == 0
+                    ? "Nenhum caminho marcado"
+                    : selected-count + (selected-count == 1 ? " caminho marcado" : " caminhos marcados");
+                font-size: 12px;
+                horizontal-stretch: 1;
+                color: Palette.foreground.transparentize(0.35);
+                vertical-alignment: center;
+            }
+
+            // Marcada, o Iniciar pergunta onde gravar antes de tocar em
+            // qualquer pasta.
+            CheckBox {
+                text: "Gravar log";
+                checked <=> log-enabled;
+                enabled: !running;
+            }
         }
 
         HorizontalLayout {
@@ -226,9 +244,11 @@ export component AppWindow inherits Window {
             overflow: elide;
         }
 
-        // Linha 2: pasta sendo verificada agora.
+        // Linha 2: pasta sendo verificada agora. Parada a varredura, o mesmo
+        // espaço vira o resultado de salvar o log — os dois nunca competem,
+        // porque `current-path` é limpo ao fim da corrida.
         Text {
-            text: current-path;
+            text: running ? current-path : log-status;
             font-size: 12px;
             color: Palette.foreground.transparentize(0.45);
             overflow: elide;

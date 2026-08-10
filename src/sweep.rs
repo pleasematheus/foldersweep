@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::log::SweepLog;
 use crate::protect::{ExactGuard, is_subtree_protected};
 
 const THROTTLE: Duration = Duration::from_millis(100);
@@ -15,7 +16,17 @@ pub struct SweepStats {
 
 /// Varre todos os alvos selecionados em sequência, acumulando contadores e
 /// tempo decorrido através da corrida inteira (não por alvo).
-pub fn sweep_all<F>(roots: &[PathBuf], cancel: &AtomicBool, on_progress: F) -> SweepStats
+///
+/// O `log` já chega aberto (ou desligado) e sai de volta para quem chama
+/// escrever o rodapé: o cabeçalho precisa existir antes da primeira pasta, e
+/// falhar em criar o arquivo é motivo para não iniciar a varredura — decisão
+/// que não cabe aqui dentro.
+pub fn sweep_all<F>(
+    roots: &[PathBuf],
+    cancel: &AtomicBool,
+    log: SweepLog,
+    on_progress: F,
+) -> (SweepStats, SweepLog)
 where
     F: FnMut(SweepStats, &Path, Duration),
 {
@@ -33,7 +44,7 @@ where
     // gastando tempo à toa.
     let walk_roots = dedupe_nested(roots);
 
-    sweep_with_guard(&walk_roots, &guard, cancel, THROTTLE, on_progress)
+    sweep_with_guard(&walk_roots, &guard, cancel, THROTTLE, log, on_progress)
 }
 
 /// Remove duplicatas exatas e alvos contidos em outro alvo já selecionado.
@@ -62,8 +73,9 @@ fn sweep_with_guard<F>(
     guard: &ExactGuard,
     cancel: &AtomicBool,
     throttle: Duration,
+    log: SweepLog,
     on_progress: F,
-) -> SweepStats
+) -> (SweepStats, SweepLog)
 where
     F: FnMut(SweepStats, &Path, Duration),
 {
@@ -75,6 +87,7 @@ where
         started,
         last_report: started,
         stats: SweepStats::default(),
+        log,
         on_progress,
     };
 
@@ -91,7 +104,7 @@ where
 
     let stats = walker.stats;
     (walker.on_progress)(stats, Path::new(""), started.elapsed());
-    stats
+    (stats, walker.log)
 }
 
 struct Walker<'a, F: FnMut(SweepStats, &Path, Duration)> {
@@ -101,6 +114,7 @@ struct Walker<'a, F: FnMut(SweepStats, &Path, Duration)> {
     started: Instant,
     last_report: Instant,
     stats: SweepStats,
+    log: SweepLog,
     on_progress: F,
 }
 
@@ -133,8 +147,8 @@ impl<F: FnMut(SweepStats, &Path, Duration)> Walker<'_, F> {
     fn walk(&mut self, root: &Path) {
         let entries = match std::fs::read_dir(root) {
             Ok(entries) => entries,
-            Err(_) => {
-                self.stats.errors += 1;
+            Err(e) => {
+                self.fail(root, &e);
                 return;
             }
         };
@@ -169,8 +183,15 @@ impl<F: FnMut(SweepStats, &Path, Duration)> Walker<'_, F> {
 
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(_) => {
-                    self.stats.errors += 1;
+                Err(e) => {
+                    // A entrada com defeito não tem caminho próprio; o
+                    // relatório aponta o diretório em que ela apareceu.
+                    let parent = stack
+                        .last()
+                        .expect("pilha não vazia: verificado na condição do while")
+                        .path
+                        .clone();
+                    self.fail(&parent, &e);
                     continue;
                 }
             };
@@ -178,8 +199,8 @@ impl<F: FnMut(SweepStats, &Path, Duration)> Walker<'_, F> {
 
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
-                Err(_) => {
-                    self.stats.errors += 1;
+                Err(e) => {
+                    self.fail(&path, &e);
                     continue;
                 }
             };
@@ -194,6 +215,7 @@ impl<F: FnMut(SweepStats, &Path, Duration)> Walker<'_, F> {
             // Conta antes da poda: uma pasta podada foi analisada, só não
             // foi descida.
             self.stats.scanned += 1;
+            self.log.record_scanned(&path);
 
             // Classe B: poda antes de descer.
             if is_subtree_protected(&path) {
@@ -202,15 +224,21 @@ impl<F: FnMut(SweepStats, &Path, Duration)> Walker<'_, F> {
 
             match std::fs::read_dir(&path) {
                 Ok(entries) => stack.push(Frame { path, entries }),
-                Err(_) => {
+                Err(e) => {
                     // Ilegível. Conta o erro e mesmo assim tenta remover, que
                     // é o que a versão recursiva fazia ao retornar da chamada:
                     // uma pasta pode estar vazia e sem permissão de leitura.
-                    self.stats.errors += 1;
+                    self.fail(&path, &e);
                     self.finish_directory(&path);
                 }
             }
         }
+    }
+
+    /// Soma um erro aos contadores e guarda o caminho junto da mensagem.
+    fn fail(&mut self, path: &Path, error: &std::io::Error) {
+        self.stats.errors += 1;
+        self.log.record_error(path, &error.to_string());
     }
 
     /// Chamado quando um diretório já teve todo o conteúdo tratado.
@@ -218,9 +246,12 @@ impl<F: FnMut(SweepStats, &Path, Duration)> Walker<'_, F> {
         // Classe A: varre por dentro (já foi feito), nunca remove ela mesma.
         if !self.guard.is_protected(path) {
             match std::fs::remove_dir(path) {
-                Ok(()) => self.stats.deleted += 1,
+                Ok(()) => {
+                    self.stats.deleted += 1;
+                    self.log.record_deleted(path);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
-                Err(_) => self.stats.errors += 1,
+                Err(e) => self.fail(path, &e),
             }
         }
 
@@ -231,6 +262,9 @@ impl<F: FnMut(SweepStats, &Path, Duration)> Walker<'_, F> {
         // por um slint::Timer na thread de UI.
         if self.last_report.elapsed() >= self.throttle {
             (self.on_progress)(self.stats, path, self.started.elapsed());
+            // O log acompanha o mesmo ritmo da janela: o que o usuário lê na
+            // tela já está no arquivo.
+            self.log.flush();
             self.last_report = Instant::now();
         }
     }
@@ -278,7 +312,12 @@ mod tests {
         let guard = ExactGuard::with_paths([exact_protected.clone()]);
         let cancel = AtomicBool::new(false);
         let roots = [root.clone()];
-        let stats = sweep_with_guard(&roots, &guard, &cancel, Duration::ZERO, |_, _, _| {});
+        // Fora da raiz varrida: um arquivo dentro dela mudaria o que a
+        // varredura enxerga, e o teste deixaria de medir o que quer.
+        let log_file = root.with_extension("log");
+        let log = SweepLog::create(&log_file, &roots, "2026-01-01 00:00:00").unwrap();
+        let (stats, log) =
+            sweep_with_guard(&roots, &guard, &cancel, Duration::ZERO, log, |_, _, _| {});
 
         assert!(!root.join("A").exists());
         assert!(root.join("com-arquivo").exists());
@@ -289,7 +328,23 @@ mod tests {
         assert_eq!(stats.deleted, 4); // C, B, A, filho-vazio
         assert_eq!(stats.errors, 0);
 
+        log.finish(stats, Duration::ZERO, false, "2026-01-01 00:01:00");
+        let report = fs::read_to_string(&log_file).unwrap();
+
+        // O log distingue o que sumiu do que só foi olhado. Montado componente
+        // a componente: `join("A/B/C")` guardaria as barras normais no texto, e
+        // o log escreve separador do Windows.
+        let deepest = root.join("A").join("B").join("C");
+        assert!(report.contains(&format!("APAGADA    {}", deepest.display())));
+        let with_file = root.join("com-arquivo");
+        assert!(report.contains(&format!("ANALISADA  {}", with_file.display())));
+        assert!(!report.contains(&format!("APAGADA    {}", with_file.display())));
+        // Subárvore podada é analisada, mas o que está dentro dela nunca
+        // aparece — nem no log.
+        assert!(!report.contains("refs"));
+
         fs::remove_dir_all(&root).ok();
+        fs::remove_file(&log_file).ok();
     }
 
     #[test]
@@ -303,12 +358,19 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let roots = [root.clone()];
         let mut seen = 0u32;
-        let stats = sweep_with_guard(&roots, &guard, &cancel, Duration::ZERO, |_, _, _| {
-            seen += 1;
-            if seen == 5 {
-                cancel.store(true, Ordering::Relaxed);
-            }
-        });
+        let (stats, _log) = sweep_with_guard(
+            &roots,
+            &guard,
+            &cancel,
+            Duration::ZERO,
+            SweepLog::disabled(),
+            |_, _, _| {
+                seen += 1;
+                if seen == 5 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        );
 
         assert!(stats.deleted > 0);
         assert!(stats.deleted < 20);
@@ -327,7 +389,14 @@ mod tests {
         let guard = ExactGuard::with_paths([]);
         let cancel = AtomicBool::new(false);
         let roots = [root.clone()];
-        let stats = sweep_with_guard(&roots, &guard, &cancel, Duration::ZERO, |_, _, _| {});
+        let (stats, _log) = sweep_with_guard(
+            &roots,
+            &guard,
+            &cancel,
+            Duration::ZERO,
+            SweepLog::disabled(),
+            |_, _, _| {},
+        );
 
         assert!(root.join(".git/objects/aa").exists());
         assert_eq!(stats.deleted, 0);
@@ -349,7 +418,14 @@ mod tests {
         let guard = ExactGuard::with_paths([]);
         let cancel = AtomicBool::new(false);
         let roots = [a.clone(), b.clone()];
-        let stats = sweep_with_guard(&roots, &guard, &cancel, Duration::ZERO, |_, _, _| {});
+        let (stats, _log) = sweep_with_guard(
+            &roots,
+            &guard,
+            &cancel,
+            Duration::ZERO,
+            SweepLog::disabled(),
+            |_, _, _| {},
+        );
 
         // Contadores somam as duas raízes em vez de zerar na segunda.
         assert_eq!(stats.deleted, 3);
@@ -395,7 +471,7 @@ mod tests {
         // Usuário selecionou o pai E o filho. O walk roda só o pai, mas o
         // guard tem que conhecer os dois.
         let roots = [root.clone(), inner.clone()];
-        sweep_all(&roots, &cancel, |_, _, _| {});
+        sweep_all(&roots, &cancel, SweepLog::disabled(), |_, _, _| {});
 
         assert!(
             !inner.join("vazia").exists(),
@@ -424,7 +500,14 @@ mod tests {
         let guard = ExactGuard::with_paths([]);
         let cancel = AtomicBool::new(false);
         let roots = [deep_root.clone()];
-        let stats = sweep_with_guard(&roots, &guard, &cancel, Duration::ZERO, |_, _, _| {});
+        let (stats, _log) = sweep_with_guard(
+            &roots,
+            &guard,
+            &cancel,
+            Duration::ZERO,
+            SweepLog::disabled(),
+            |_, _, _| {},
+        );
 
         // Cascata inteira numa passada, sem estourar a pilha. Com quadros
         // recursivos (~1,2 KB cada por causa dos dois WIN32_FIND_DATAW),
@@ -443,7 +526,14 @@ mod tests {
         let guard = ExactGuard::new(std::slice::from_ref(&root));
         let cancel = AtomicBool::new(false);
         let roots = [root.clone()];
-        sweep_with_guard(&roots, &guard, &cancel, Duration::ZERO, |_, _, _| {});
+        sweep_with_guard(
+            &roots,
+            &guard,
+            &cancel,
+            Duration::ZERO,
+            SweepLog::disabled(),
+            |_, _, _| {},
+        );
 
         assert!(root.exists());
         fs::remove_dir_all(&root).ok();

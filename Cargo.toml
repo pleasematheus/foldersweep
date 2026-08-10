@@ -1,21 +1,34 @@
 [package]
 name = "foldersweep"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 build = "build.rs"
+description = "Remove pastas vazias dos caminhos que você marcar"
+
+# O nome do pacote é o da crate, e crate em Rust é minúscula por convenção. O
+# executável não precisa herdar isso: um alvo `[[bin]]` explícito nomeia o
+# arquivo que sai do build, e é esse nome que aparece no Explorer.
+[[bin]]
+name = "FolderSweep"
+path = "src/main.rs"
 
 [dependencies]
 slint = "1.17.1"
 sysinfo = "0.39.6"
 dirs = "6.0.0"
+rfd = { version = "0.17.2", default-features = false }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
 [build-dependencies]
 slint-build = "1.17.1"
 winresource = "0.1.31"
 
+# Nada aqui altera o conjunto de instruções gerado — quem faz isso é
+# `target-cpu`, em `.cargo/config.toml`. Estas chaves mexem só em tamanho e
+# tempo de build, e são seguras em qualquer x86-64.
 [profile.release]
 opt-level = "z"
-lto = true
+lto = "thin"
 codegen-units = 1
 strip = true
 panic = "abort"

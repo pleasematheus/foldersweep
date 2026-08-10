@@ -28,9 +28,10 @@ Ainda assim: **teste numa pasta descartável antes de soltar num disco inteiro.*
 
 1. O app lista os discos montados como raízes de uma árvore.
 2. Você expande até onde quiser e **marca** os caminhos a limpar — um ou vários, em qualquer nível, em qualquer combinação de discos.
-3. Iniciar varre os caminhos marcados em sequência, numa thread separada.
-4. Barra indeterminada mais contadores ao vivo: analisadas, apagadas, erros, tempo decorrido.
-5. Cancelar interrompe entre uma remoção e a próxima.
+3. Opcionalmente marque **Gravar log** — o Iniciar então pergunta onde salvar o `.txt` antes de tocar em qualquer pasta.
+4. Iniciar varre os caminhos marcados em sequência, numa thread separada.
+5. Barra indeterminada mais contadores ao vivo: analisadas, apagadas, erros, tempo decorrido.
+6. Cancelar interrompe entre uma remoção e a próxima.
 
 ```
 ┌──────────────────────────────────────────────┐
@@ -44,7 +45,7 @@ Ainda assim: **teste numa pasta descartável antes de soltar num disco inteiro.*
 │ │    ▸ Windows        protegido            │ │
 │ │ ▸ E:\           USB    57 GB  removível  │ │
 │ └──────────────────────────────────────────┘ │
-│  1 caminho marcado                           │
+│  1 caminho marcado             [x] Gravar log│
 │  [ Iniciar ]  [ Cancelar ]                   │
 │  ░░▓▓▓▓░░░░░░░░░░░░░                         │
 │  12.483 analisadas · 213 apagadas · 0 erros · 2:07
@@ -55,6 +56,30 @@ Ainda assim: **teste numa pasta descartável antes de soltar num disco inteiro.*
 A árvore carrega **um nível por vez**, sob demanda. O app nunca enumera um disco inteiro antes de começar — é justamente o que a barra indeterminada existe para evitar.
 
 Cancelar é seguro em qualquer momento. A unidade de trabalho é uma única chamada `remove_dir`, atômica e independente: não existe "meio de uma remoção", nem estado parcial, nem rollback. Parar em 213 de 500 deixa 213 removidas e 287 no disco.
+
+### O log
+
+Com **Gravar log** marcada, o Iniciar abre o diálogo de salvar do Windows e só depois começa a varrer. O arquivo é escrito **conforme a análise anda**, não montado no fim: cada pasta vira uma linha assim que é tocada, e o buffer é descarregado no mesmo ritmo em que a janela atualiza os contadores. Fechar o app no meio da corrida deixa no disco tudo o que já tinha acontecido.
+
+```
+Folder Sweep — log de varredura
+Iniciado em: 2026-08-09 14:33:02
+Caminhos marcados:
+  D:\Projetos
+
+ANALISADA  D:\Projetos\app-antigo
+ANALISADA  D:\Projetos\app-antigo\build
+APAGADA    D:\Projetos\app-antigo\build
+ERRO       D:\Projetos\travada — Acesso negado. (os error 5)
+
+Concluído em: 2026-08-09 14:36:09
+Duração: 3:07
+Resumo: 12483 analisadas · 213 apagadas · 1 erros
+```
+
+Ordem cronológica com tag por linha, e não seções agrupadas: em stream as três categorias chegam intercaladas, então agrupar exigiria segurar tudo em memória — exatamente o que escrever ao vivo evita. Um `findstr APAGADA` recupera o agrupamento quando ele fizer falta.
+
+Se o destino não puder ser criado, ou se o diálogo for fechado sem escolher, **a varredura não começa**: quem marcou a caixa pediu o registro, e apagar sem ele é o oposto do pedido. Se a escrita falhar no meio, aí sim a varredura segue — o disco já foi alterado, parar na metade deixaria um estado que ninguém pediu — e a janela avisa que o log ficou incompleto.
 
 ---
 
@@ -111,7 +136,9 @@ Sem dependência de sistema além do toolchain. O `build.rs` compila o `.slint` 
 |---|---|
 | `slint` | GUI, estilo `fluent` (segue o tema claro/escuro do Windows) |
 | `sysinfo` | enumerar volumes montados |
-| `dirs` | resolver Known Folders pelo caminho real |
+| `dirs` | resolver Known Folders pelo caminho real, e a pasta Documentos como destino inicial do log |
+| `rfd` | diálogo nativo de salvar arquivo |
+| `chrono` | data e hora locais no cabeçalho e no rodapé do log |
 | `slint-build` | compilar `ui/app.slint` (build) |
 | `winresource` | embutir `ui/app.ico` no executável (build) |
 
@@ -126,6 +153,7 @@ src/
   main.rs      wiring da UI, worker thread, estado da árvore e da seleção
   sweep.rs     recursão pós-ordem, dedupe de raízes, cancelamento, throttle
   protect.rs   classes A e B, comparação case-insensitive de caminho
+  log.rs       arquivo de log escrito ao vivo, cabeçalho e rodapé
   tree.rs      listagem de um nível, contagem de descendentes
   disks.rs     enumeração de volumes
 ui/
@@ -133,7 +161,7 @@ ui/
 openspec/      proposta, design e specs da mudança
 ```
 
-~1.300 linhas, 27 testes.
+~1.870 linhas, 33 testes.
 
 ---
 

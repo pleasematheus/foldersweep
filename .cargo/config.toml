@@ -1,0 +1,21 @@
+# Linha de base de instruções, fixada de propósito.
+#
+# Este binário é distribuído para máquinas que não são a de build. Qualquer
+# flag que suba a ISA — `target-cpu=native`, `x86-64-v3`, `target-feature=+avx2`
+# — faz o LLVM emitir AVX2/BMI2/FMA no programa inteiro, e aí a primeira dessas
+# instruções num CPU mais velho derruba o processo com STATUS_ILLEGAL_INSTRUCTION
+# (0xC000001D), sem mensagem útil. Sandy Bridge (Core i7 de 2ª geração, 2011)
+# não tem nenhuma das três.
+#
+# `x86-64` é o nível de base do alvo: SSE2, roda em qualquer x86-64 desde 2003.
+# Perder nada: este app é limitado por I/O de disco, não por vetorização. As
+# bibliotecas que realmente se beneficiam de SIMD (decodificação de imagem,
+# busca em bytes) já escolhem o caminho AVX2 em tempo de execução via CPUID —
+# isso continua funcionando, porque o teste acontece na máquina do usuário.
+#
+# Atenção: a variável de ambiente RUSTFLAGS **substitui** este bloco inteiro em
+# vez de somar. Se ela estiver definida no shell, o que está aqui não vale.
+[build]
+rustflags = [
+    "-C", "target-cpu=x86-64",
+]

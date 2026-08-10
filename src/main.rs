@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod disks;
+mod log;
 mod protect;
 mod sweep;
 mod tree;
@@ -11,9 +12,10 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use slint::{Model, ModelRc, SharedString, VecModel};
+
+use crate::log::{LogOutcome, SweepLog, format_elapsed};
 
 slint::include_modules!();
 
@@ -114,6 +116,21 @@ fn main() -> Result<(), slint::PlatformError> {
             // HashSet não tem ordem; ordenar deixa a varredura determinística.
             roots.sort();
 
+            // O log é aberto antes da primeira pasta, não depois da última:
+            // ele é escrito conforme a varredura anda. Isso puxa a escolha do
+            // destino para cá, antes de qualquer remoção.
+            let started_at = log::now_text();
+            let sweep_log = match open_log_if_requested(&window, &roots, &started_at) {
+                Ok(log) => log,
+                Err(status) => {
+                    // Nada foi apagado ainda. Sem log utilizável, a varredura
+                    // não começa: quem marcou a caixa pediu o registro, e
+                    // apagar sem ele é o oposto do que foi pedido.
+                    window.set_log_status(status.into());
+                    return;
+                }
+            };
+
             let cancel = Arc::new(AtomicBool::new(false));
             *cancel_flag.borrow_mut() = Some(cancel.clone());
 
@@ -124,27 +141,43 @@ fn main() -> Result<(), slint::PlatformError> {
             window.set_error_count(0);
             window.set_elapsed_text("0:00".into());
             window.set_current_path(SharedString::new());
+            window.set_log_status(SharedString::new());
 
             let window_weak = window_weak.clone();
             std::thread::spawn(move || {
+                let started = std::time::Instant::now();
                 let progress_weak = window_weak.clone();
-                let stats = sweep::sweep_all(&roots, &cancel, move |stats, path, elapsed| {
-                    let window_weak = progress_weak.clone();
-                    let path_text: SharedString = path.display().to_string().into();
-                    let elapsed_text: SharedString = format_elapsed(elapsed).into();
-                    let scanned = stats.scanned as i32;
-                    let deleted = stats.deleted as i32;
-                    let errors = stats.errors as i32;
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(window) = window_weak.upgrade() {
-                            window.set_scanned_count(scanned);
-                            window.set_deleted_count(deleted);
-                            window.set_error_count(errors);
-                            window.set_elapsed_text(elapsed_text);
-                            window.set_current_path(path_text);
-                        }
+                let (stats, sweep_log) =
+                    sweep::sweep_all(&roots, &cancel, sweep_log, move |stats, path, elapsed| {
+                        let window_weak = progress_weak.clone();
+                        let path_text: SharedString = path.display().to_string().into();
+                        let elapsed_text: SharedString = format_elapsed(elapsed).into();
+                        let scanned = stats.scanned as i32;
+                        let deleted = stats.deleted as i32;
+                        let errors = stats.errors as i32;
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(window) = window_weak.upgrade() {
+                                window.set_scanned_count(scanned);
+                                window.set_deleted_count(deleted);
+                                window.set_error_count(errors);
+                                window.set_elapsed_text(elapsed_text);
+                                window.set_current_path(path_text);
+                            }
+                        });
                     });
-                });
+
+                let log_status = match sweep_log.finish(
+                    stats,
+                    started.elapsed(),
+                    cancel.load(Ordering::Relaxed),
+                    &log::now_text(),
+                ) {
+                    LogOutcome::Disabled => String::new(),
+                    LogOutcome::Written(path) => format!("Log gravado em {}", path.display()),
+                    // A varredura terminou de verdade; só o registro dela é
+                    // que ficou incompleto, e dizer isso é o mínimo.
+                    LogOutcome::Failed(e) => format!("Log interrompido por erro de escrita: {e}"),
+                };
 
                 let scanned = stats.scanned as i32;
                 let deleted = stats.deleted as i32;
@@ -152,6 +185,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(window) = window_weak.upgrade() {
                         window.set_running(false);
+                        window.set_log_status(log_status.into());
                         // Marca que uma corrida aconteceu. Sem isso, uma
                         // varredura que analisou zero pastas (pasta folha
                         // marcada) não mostraria resumo nenhum, e "nunca
@@ -196,6 +230,34 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     window.run()
+}
+
+/// Abre o arquivo de log, se a caixa estiver marcada.
+///
+/// `Err` carrega a mensagem para a janela e significa "não inicie a
+/// varredura": ou o usuário desistiu no diálogo, ou o arquivo não pôde ser
+/// criado. Caixa desmarcada devolve um log desligado, que engole tudo.
+fn open_log_if_requested(
+    window: &AppWindow,
+    roots: &[PathBuf],
+    started_at: &str,
+) -> Result<SweepLog, String> {
+    if !window.get_log_enabled() {
+        return Ok(SweepLog::disabled());
+    }
+
+    let Some(target) = rfd::FileDialog::new()
+        .set_title("Onde gravar o log da varredura")
+        .set_file_name(log::suggested_file_name(started_at))
+        .add_filter("Arquivo de texto", &["txt"])
+        .set_directory(dirs::document_dir().unwrap_or_else(std::env::temp_dir))
+        .save_file()
+    else {
+        return Err("Varredura não iniciada: nenhum destino escolhido para o log.".into());
+    };
+
+    SweepLog::create(&target, roots, started_at)
+        .map_err(|e| format!("Varredura não iniciada: não deu para criar o log ({e})."))
 }
 
 /// Insere os subdiretórios logo abaixo da linha, um nível mais fundo.
@@ -252,31 +314,4 @@ fn collapse(rows: &Rows, index: usize) {
     all.drain(index + 1..index + 1 + count);
     all[index].expanded = false;
     rows.set_vec(all);
-}
-
-fn format_elapsed(elapsed: Duration) -> String {
-    let total = elapsed.as_secs();
-    let (hours, minutes, seconds) = (total / 3600, (total % 3600) / 60, total % 60);
-    if hours > 0 {
-        format!("{hours}:{minutes:02}:{seconds:02}")
-    } else {
-        format!("{minutes}:{seconds:02}")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn formats_elapsed_under_an_hour() {
-        assert_eq!(format_elapsed(Duration::from_secs(0)), "0:00");
-        assert_eq!(format_elapsed(Duration::from_secs(7)), "0:07");
-        assert_eq!(format_elapsed(Duration::from_secs(187)), "3:07");
-    }
-
-    #[test]
-    fn formats_elapsed_over_an_hour() {
-        assert_eq!(format_elapsed(Duration::from_secs(3723)), "1:02:03");
-    }
 }
