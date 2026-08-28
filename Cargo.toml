@@ -13,7 +13,7 @@ name = "FolderSweep"
 path = "src/main.rs"
 
 [dependencies]
-slint = "1.17.1"
+slint = { version = "1.17.1", features = ["renderer-software", "backend-winit"] }
 sysinfo = "0.39.6"
 dirs = "6.0.0"
 rfd = { version = "0.17.2", default-features = false }
