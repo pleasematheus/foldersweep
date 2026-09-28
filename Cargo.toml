@@ -1,6 +1,6 @@
 [package]
 name = "foldersweep"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 build = "build.rs"
 description = "Remove pastas vazias dos caminhos que você marcar"
@@ -13,7 +13,7 @@ name = "FolderSweep"
 path = "src/main.rs"
 
 [dependencies]
-slint = { version = "1.17.1", features = ["renderer-software", "backend-winit"] }
+slint = { version = "1.17.1", default-features = false, features = ["renderer-software", "backend-winit", "accessibility", "compat-1-2", "system-tray"] }
 sysinfo = "0.39.6"
 dirs = "6.0.0"
 rfd = { version = "0.17.2", default-features = false }
