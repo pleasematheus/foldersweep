@@ -11,11 +11,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use slint::{Model, ModelRc, SharedString, VecModel};
 
 use crate::log::{LogOutcome, SweepLog, format_elapsed};
+use crate::sweep::{Cancellation, SweepOutcome};
 
 slint::include_modules!();
 
@@ -48,7 +48,7 @@ fn main() -> Result<(), slint::PlatformError> {
     window.set_rows(ModelRc::from(rows.clone()));
 
     let selection: Selection = Rc::new(RefCell::new(HashSet::new()));
-    let cancel_flag: Rc<RefCell<Option<Arc<AtomicBool>>>> = Rc::new(RefCell::new(None));
+    let cancel_flag: Rc<RefCell<Option<Arc<Cancellation>>>> = Rc::new(RefCell::new(None));
 
     window.on_toggle_expand({
         let rows = rows.clone();
@@ -104,6 +104,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     window.on_start({
         let window_weak = window.as_weak();
+        let rows = rows.clone();
         let selection = selection.clone();
         let cancel_flag = cancel_flag.clone();
         move || {
@@ -131,24 +132,32 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
             };
 
-            let cancel = Arc::new(AtomicBool::new(false));
+            let mut loaded_paths: HashSet<PathBuf> = rows
+                .iter()
+                .filter(|row| row.depth > 0)
+                .map(|row| PathBuf::from(row.path.as_str()))
+                .collect();
+            let cancel = Arc::new(Cancellation::default());
             *cancel_flag.borrow_mut() = Some(cancel.clone());
 
-            window.set_running(true);
-            window.set_finished(false);
             window.set_scanned_count(0);
             window.set_deleted_count(0);
             window.set_error_count(0);
             window.set_elapsed_text("0:00".into());
             window.set_current_path(SharedString::new());
             window.set_log_status(SharedString::new());
+            window.set_sweep_state(SweepState::Running);
 
             let window_weak = window_weak.clone();
             std::thread::spawn(move || {
                 let started = std::time::Instant::now();
                 let progress_weak = window_weak.clone();
-                let (stats, sweep_log) =
-                    sweep::sweep_all(&roots, &cancel, sweep_log, move |stats, path, elapsed| {
+                let mut removed_paths = HashSet::new();
+                let (stats, outcome, sweep_log) = sweep::sweep_all(
+                    &roots,
+                    &cancel,
+                    sweep_log,
+                    move |stats, path, elapsed| {
                         let window_weak = progress_weak.clone();
                         let path_text: SharedString = path.display().to_string().into();
                         let elapsed_text: SharedString = format_elapsed(elapsed).into();
@@ -164,14 +173,23 @@ fn main() -> Result<(), slint::PlatformError> {
                                 window.set_current_path(path_text);
                             }
                         });
-                    });
+                    },
+                    |path| {
+                        if let Some(path) = loaded_paths.take(path) {
+                            removed_paths.insert(path);
+                        }
+                    },
+                );
 
-                let log_status = match sweep_log.finish(
-                    stats,
-                    started.elapsed(),
-                    cancel.load(Ordering::Relaxed),
-                    &log::now_text(),
-                ) {
+                let finishing_weak = window_weak.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(window) = finishing_weak.upgrade() {
+                        window.set_sweep_state(SweepState::Finishing);
+                    }
+                });
+
+                let elapsed = started.elapsed();
+                let log_status = match sweep_log.finish(stats, elapsed, outcome, &log::now_text()) {
                     LogOutcome::Disabled => String::new(),
                     LogOutcome::Written(path) => format!("Log gravado em {}", path.display()),
                     // A varredura terminou de verdade; só o registro dela é
@@ -182,20 +200,23 @@ fn main() -> Result<(), slint::PlatformError> {
                 let scanned = stats.scanned as i32;
                 let deleted = stats.deleted as i32;
                 let errors = stats.errors as i32;
+                let elapsed_text: SharedString = format_elapsed(elapsed).into();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(window) = window_weak.upgrade() {
-                        window.set_running(false);
+                        let rows = window.get_rows();
+                        if let Some(rows) = rows.as_any().downcast_ref::<VecModel<TreeRow>>() {
+                            remove_deleted_rows(rows, &removed_paths);
+                        }
                         window.set_log_status(log_status.into());
-                        // Marca que uma corrida aconteceu. Sem isso, uma
-                        // varredura que analisou zero pastas (pasta folha
-                        // marcada) não mostraria resumo nenhum, e "nunca
-                        // rodou" ficaria indistinguível de "rodou e não
-                        // achou nada".
-                        window.set_finished(true);
                         window.set_scanned_count(scanned);
                         window.set_deleted_count(deleted);
                         window.set_error_count(errors);
+                        window.set_elapsed_text(elapsed_text);
                         window.set_current_path(SharedString::new());
+                        window.set_sweep_state(match outcome {
+                            SweepOutcome::Completed => SweepState::Completed,
+                            SweepOutcome::Cancelled => SweepState::Cancelled,
+                        });
                     }
                 });
             });
@@ -203,10 +224,15 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     window.on_cancel({
+        let window_weak = window.as_weak();
         let cancel_flag = cancel_flag.clone();
         move || {
-            if let Some(cancel) = cancel_flag.borrow().as_ref() {
-                cancel.store(true, Ordering::Relaxed);
+            if let Some(window) = window_weak.upgrade()
+                && window.get_sweep_state() == SweepState::Running
+                && let Some(cancel) = cancel_flag.borrow().as_ref()
+            {
+                cancel.request();
+                window.set_sweep_state(SweepState::Cancelling);
             }
         }
     });
@@ -223,7 +249,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let cancel_flag = cancel_flag.clone();
         move || {
             if let Some(cancel) = cancel_flag.borrow().as_ref() {
-                cancel.store(true, Ordering::Relaxed);
+                cancel.request();
             }
             slint::CloseRequestResponse::HideWindow
         }
@@ -314,4 +340,71 @@ fn collapse(rows: &Rows, index: usize) {
     all.drain(index + 1..index + 1 + count);
     all[index].expanded = false;
     rows.set_vec(all);
+}
+
+fn remove_deleted_rows(rows: &VecModel<TreeRow>, removed: &HashSet<PathBuf>) {
+    if removed.is_empty() {
+        return;
+    }
+
+    let mut removed_depth = None;
+    let mut remaining = Vec::new();
+    for row in rows.iter() {
+        if removed_depth.is_some_and(|depth| row.depth > depth) {
+            continue;
+        }
+        removed_depth = None;
+        if removed.contains(Path::new(row.path.as_str())) {
+            removed_depth = Some(row.depth);
+        } else {
+            remaining.push(row);
+        }
+    }
+
+    for index in 0..remaining.len() {
+        let next_depth = remaining.get(index + 1).map(|row| row.depth);
+        let row = &mut remaining[index];
+        if row.expanded && next_depth.is_none_or(|depth| depth <= row.depth) {
+            // Um novo clique consulta o disco de novo.
+            row.expanded = false;
+        }
+    }
+    rows.set_vec(remaining);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pruning_deleted_rows_preserves_selection_and_other_expansions() {
+        let row = |path: &str, depth, expanded, selected| TreeRow {
+            path: path.into(),
+            depth,
+            expanded,
+            selected,
+            expandable: true,
+            ..TreeRow::default()
+        };
+        let rows = VecModel::from(vec![
+            row(r"D:\", 0, true, false),
+            row(r"D:\Selecionada", 1, true, true),
+            row(r"D:\Selecionada\Apagada", 2, true, false),
+            row(r"D:\Selecionada\Apagada\Descendente", 3, false, false),
+            row(r"D:\Outra", 1, true, false),
+            row(r"D:\Outra\Filha", 2, false, false),
+        ]);
+        let removed = HashSet::from([PathBuf::from(r"D:\Selecionada\Apagada")]);
+
+        remove_deleted_rows(&rows, &removed);
+
+        let remaining: Vec<_> = rows.iter().collect();
+        assert_eq!(remaining.len(), 4);
+        assert_eq!(remaining[1].path.as_str(), r"D:\Selecionada");
+        assert!(remaining[1].selected);
+        assert!(!remaining[1].expanded);
+        assert_eq!(remaining[2].path.as_str(), r"D:\Outra");
+        assert!(remaining[2].expanded);
+        assert_eq!(remaining[3].path.as_str(), r"D:\Outra\Filha");
+    }
 }

@@ -13,6 +13,15 @@ export struct TreeRow {
     removable: bool,
 }
 
+export enum SweepState {
+    idle,
+    running,
+    cancelling,
+    finishing,
+    completed,
+    cancelled,
+}
+
 // Seta de expandir/colapsar desenhada como vetor, não como glifo Unicode.
 // `▸`/`▾` (U+25B8/U+25BE) moram no Segoe UI Symbol, não no Segoe UI base, e
 // o fallback de fonte do renderer do Slint não os alcança — apareciam como
@@ -59,8 +68,11 @@ export component AppWindow inherits Window {
 
     in property <[TreeRow]> rows: [];
     in property <int> selected-count: 0;
-    in property <bool> running: false;
-    in property <bool> finished: false;
+    in property <SweepState> sweep-state: SweepState.idle;
+    private property <bool> running: sweep-state == SweepState.running
+        || sweep-state == SweepState.cancelling
+        || sweep-state == SweepState.finishing;
+    private property <string> summary-prefix: "";
     in property <int> scanned-count: 0;
     in property <int> deleted-count: 0;
     in property <int> error-count: 0;
@@ -76,6 +88,21 @@ export component AppWindow inherits Window {
     callback cancel();
     callback toggle-expand(int);
     callback toggle-select(int);
+
+    states [
+        cancelling when sweep-state == SweepState.cancelling: {
+            summary-prefix: "Cancelando · ";
+        }
+        finishing when sweep-state == SweepState.finishing: {
+            summary-prefix: "Finalizando · ";
+        }
+        completed when sweep-state == SweepState.completed: {
+            summary-prefix: "Concluído · ";
+        }
+        cancelled when sweep-state == SweepState.cancelled: {
+            summary-prefix: "Cancelado · ";
+        }
+    ]
 
     VerticalLayout {
         padding: 12px;
@@ -218,7 +245,7 @@ export component AppWindow inherits Window {
             }
             Button {
                 text: "Cancelar";
-                enabled: running;
+                enabled: sweep-state == SweepState.running;
                 clicked => { cancel(); }
             }
         }
@@ -228,14 +255,11 @@ export component AppWindow inherits Window {
             height: 6px;
         }
 
-        // Linha 1: contadores + tempo decorrido. A condição olha `finished`,
-        // não `scanned-count`: uma corrida que analisou zero pastas ainda
-        // precisa mostrar o resumo.
+        // Exibe o resumo inclusive quando a varredura analisou zero pastas.
         Text {
-            text: !running && !finished
+            text: sweep-state == SweepState.idle
                 ? ""
-                : (running ? "" : "Concluído · ")
-                    + scanned-count + " analisadas · "
+                : summary-prefix + scanned-count + " analisadas · "
                     + deleted-count + " apagadas · "
                     + error-count + " erros · "
                     + elapsed-text;

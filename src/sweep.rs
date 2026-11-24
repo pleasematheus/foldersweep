@@ -1,9 +1,11 @@
+use std::io;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::log::SweepLog;
-use crate::protect::{ExactGuard, is_subtree_protected};
+use crate::protect::{ExactGuard, is_subtree_protected, validate_sweep_root};
 
 const THROTTLE: Duration = Duration::from_millis(100);
 
@@ -12,6 +14,54 @@ pub struct SweepStats {
     pub scanned: u64,
     pub deleted: u64,
     pub errors: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepOutcome {
+    Completed,
+    Cancelled,
+}
+
+#[derive(Default)]
+pub struct Cancellation(AtomicU8);
+
+impl Cancellation {
+    const READY: u8 = 0;
+    const REMOVING: u8 = 1;
+    const REQUESTED: u8 = 2;
+
+    pub fn request(&self) {
+        self.0.store(Self::REQUESTED, Ordering::Relaxed);
+    }
+
+    fn is_requested(&self) -> bool {
+        self.0.load(Ordering::Relaxed) == Self::REQUESTED
+    }
+
+    fn remove_dir(&self, path: &Path) -> ControlFlow<(), io::Result<()>> {
+        // O início da remoção disputa o mesmo estado atômico que o pedido
+        // de cancelamento. Uma tentativa já iniciada pode terminar.
+        if self
+            .0
+            .compare_exchange(
+                Self::READY,
+                Self::REMOVING,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return ControlFlow::Break(());
+        }
+        let result = std::fs::remove_dir(path);
+        let _ = self.0.compare_exchange(
+            Self::REMOVING,
+            Self::READY,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        ControlFlow::Continue(result)
+    }
 }
 
 /// Varre todos os alvos selecionados em sequência, acumulando contadores e
@@ -23,10 +73,11 @@ pub struct SweepStats {
 /// que não cabe aqui dentro.
 pub fn sweep_all<F>(
     roots: &[PathBuf],
-    cancel: &AtomicBool,
+    cancel: &Cancellation,
     log: SweepLog,
     on_progress: F,
-) -> (SweepStats, SweepLog)
+    mut on_removed: impl FnMut(&Path),
+) -> (SweepStats, SweepOutcome, SweepLog)
 where
     F: FnMut(SweepStats, &Path, Duration),
 {
@@ -44,7 +95,15 @@ where
     // gastando tempo à toa.
     let walk_roots = dedupe_nested(roots);
 
-    sweep_with_guard(&walk_roots, &guard, cancel, THROTTLE, log, on_progress)
+    sweep_with_guard(
+        &walk_roots,
+        &guard,
+        cancel,
+        THROTTLE,
+        log,
+        on_progress,
+        &mut on_removed,
+    )
 }
 
 /// Remove duplicatas exatas e alvos contidos em outro alvo já selecionado.
@@ -71,11 +130,12 @@ fn dedupe_nested(roots: &[PathBuf]) -> Vec<PathBuf> {
 fn sweep_with_guard<F>(
     roots: &[PathBuf],
     guard: &ExactGuard,
-    cancel: &AtomicBool,
+    cancel: &Cancellation,
     throttle: Duration,
     log: SweepLog,
     on_progress: F,
-) -> (SweepStats, SweepLog)
+    on_removed: &mut dyn FnMut(&Path),
+) -> (SweepStats, SweepOutcome, SweepLog)
 where
     F: FnMut(SweepStats, &Path, Duration),
 {
@@ -89,33 +149,36 @@ where
         stats: SweepStats::default(),
         log,
         on_progress,
+        on_removed,
     };
 
     // Sequencial, não paralelo: a varredura é limitada por I/O de disco e
     // paralelizar exigiria coordenar contadores entre threads sem ganho real.
     // ponytail: se varrer 4 discos ao mesmo tempo virar comum e lento,
     // uma thread por raiz com stats via Mutex é o próximo passo.
+    let mut outcome = SweepOutcome::Completed;
     for root in roots {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.is_requested() || walker.walk(root).is_break() {
+            outcome = SweepOutcome::Cancelled;
             break;
         }
-        walker.walk(root);
     }
 
     let stats = walker.stats;
     (walker.on_progress)(stats, Path::new(""), started.elapsed());
-    (stats, walker.log)
+    (stats, outcome, walker.log)
 }
 
 struct Walker<'a, F: FnMut(SweepStats, &Path, Duration)> {
     guard: &'a ExactGuard,
-    cancel: &'a AtomicBool,
+    cancel: &'a Cancellation,
     throttle: Duration,
     started: Instant,
     last_report: Instant,
     stats: SweepStats,
     log: SweepLog,
     on_progress: F,
+    on_removed: &'a mut dyn FnMut(&Path),
 }
 
 /// Um diretório aberto na pilha de travessia.
@@ -144,12 +207,20 @@ impl<F: FnMut(SweepStats, &Path, Duration)> Walker<'_, F> {
     /// Não corromperia nada — cada remoção é atômica e independente — mas
     /// mataria o processo no meio da varredura. Com a pilha no heap, a
     /// profundidade passa a custar só memória.
-    fn walk(&mut self, root: &Path) {
+    fn walk(&mut self, root: &Path) -> ControlFlow<()> {
+        if let Err(e) = validate_sweep_root(root) {
+            self.fail(root, &e);
+            return ControlFlow::Continue(());
+        }
+        if self.cancel.is_requested() {
+            return ControlFlow::Break(());
+        }
+
         let entries = match std::fs::read_dir(root) {
             Ok(entries) => entries,
             Err(e) => {
                 self.fail(root, &e);
-                return;
+                return ControlFlow::Continue(());
             }
         };
         let mut stack = vec![Frame {
@@ -158,8 +229,8 @@ impl<F: FnMut(SweepStats, &Path, Duration)> Walker<'_, F> {
         }];
 
         while !stack.is_empty() {
-            if self.cancel.load(Ordering::Relaxed) {
-                return;
+            if self.cancel.is_requested() {
+                return ControlFlow::Break(());
             }
 
             // Borrow escopado a esta linha só, para a pilha ficar livre para
@@ -176,7 +247,7 @@ impl<F: FnMut(SweepStats, &Path, Duration)> Walker<'_, F> {
                 // ninguém abaixo para chamar `finish_directory`.
                 let done = stack.pop().expect("pilha não vazia");
                 if !stack.is_empty() {
-                    self.finish_directory(&done.path);
+                    self.finish_directory(&done.path)?;
                 }
                 continue;
             };
@@ -229,10 +300,11 @@ impl<F: FnMut(SweepStats, &Path, Duration)> Walker<'_, F> {
                     // é o que a versão recursiva fazia ao retornar da chamada:
                     // uma pasta pode estar vazia e sem permissão de leitura.
                     self.fail(&path, &e);
-                    self.finish_directory(&path);
+                    self.finish_directory(&path)?;
                 }
             }
         }
+        ControlFlow::Continue(())
     }
 
     /// Soma um erro aos contadores e guarda o caminho junto da mensagem.
@@ -242,13 +314,14 @@ impl<F: FnMut(SweepStats, &Path, Duration)> Walker<'_, F> {
     }
 
     /// Chamado quando um diretório já teve todo o conteúdo tratado.
-    fn finish_directory(&mut self, path: &Path) {
+    fn finish_directory(&mut self, path: &Path) -> ControlFlow<()> {
         // Classe A: varre por dentro (já foi feito), nunca remove ela mesma.
         if !self.guard.is_protected(path) {
-            match std::fs::remove_dir(path) {
+            match self.cancel.remove_dir(path)? {
                 Ok(()) => {
                     self.stats.deleted += 1;
                     self.log.record_deleted(path);
+                    (self.on_removed)(path);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
                 Err(e) => self.fail(path, &e),
@@ -267,6 +340,7 @@ impl<F: FnMut(SweepStats, &Path, Duration)> Walker<'_, F> {
             self.log.flush();
             self.last_report = Instant::now();
         }
+        ControlFlow::Continue(())
     }
 }
 
@@ -310,14 +384,22 @@ mod tests {
         fs::create_dir_all(root.join(".git/refs/tags")).unwrap();
 
         let guard = ExactGuard::with_paths([exact_protected.clone()]);
-        let cancel = AtomicBool::new(false);
+        let cancel = Cancellation::default();
         let roots = [root.clone()];
         // Fora da raiz varrida: um arquivo dentro dela mudaria o que a
         // varredura enxerga, e o teste deixaria de medir o que quer.
         let log_file = root.with_extension("log");
         let log = SweepLog::create(&log_file, &roots, "2026-01-01 00:00:00").unwrap();
-        let (stats, log) =
-            sweep_with_guard(&roots, &guard, &cancel, Duration::ZERO, log, |_, _, _| {});
+        let mut removed = Vec::new();
+        let (stats, outcome, log) = sweep_with_guard(
+            &roots,
+            &guard,
+            &cancel,
+            Duration::ZERO,
+            log,
+            |_, _, _| {},
+            &mut |path| removed.push(path.to_path_buf()),
+        );
 
         assert!(!root.join("A").exists());
         assert!(root.join("com-arquivo").exists());
@@ -327,14 +409,17 @@ mod tests {
         assert!(root.join(".git/refs/tags").exists());
         assert_eq!(stats.deleted, 4); // C, B, A, filho-vazio
         assert_eq!(stats.errors, 0);
+        assert_eq!(outcome, SweepOutcome::Completed);
+        assert_eq!(removed.len(), 4);
 
-        log.finish(stats, Duration::ZERO, false, "2026-01-01 00:01:00");
+        log.finish(stats, Duration::ZERO, outcome, "2026-01-01 00:01:00");
         let report = fs::read_to_string(&log_file).unwrap();
 
         // O log distingue o que sumiu do que só foi olhado. Montado componente
         // a componente: `join("A/B/C")` guardaria as barras normais no texto, e
         // o log escreve separador do Windows.
         let deepest = root.join("A").join("B").join("C");
+        assert!(removed.contains(&deepest));
         assert!(report.contains(&format!("APAGADA    {}", deepest.display())));
         let with_file = root.join("com-arquivo");
         assert!(report.contains(&format!("ANALISADA  {}", with_file.display())));
@@ -355,10 +440,10 @@ mod tests {
         }
 
         let guard = ExactGuard::with_paths([]);
-        let cancel = AtomicBool::new(false);
+        let cancel = Cancellation::default();
         let roots = [root.clone()];
         let mut seen = 0u32;
-        let (stats, _log) = sweep_with_guard(
+        let (stats, outcome, _log) = sweep_with_guard(
             &roots,
             &guard,
             &cancel,
@@ -367,11 +452,13 @@ mod tests {
             |_, _, _| {
                 seen += 1;
                 if seen == 5 {
-                    cancel.store(true, Ordering::Relaxed);
+                    cancel.request();
                 }
             },
+            &mut |_| {},
         );
 
+        assert_eq!(outcome, SweepOutcome::Cancelled);
         assert!(stats.deleted > 0);
         assert!(stats.deleted < 20);
 
@@ -382,20 +469,52 @@ mod tests {
     }
 
     #[test]
+    fn request_before_removal_keeps_the_directory() {
+        let path = temp_root("cancel-before-remove");
+        let cancel = Cancellation::default();
+
+        // Simula o pedido depois da checagem inicial da iteração.
+        assert!(!cancel.is_requested());
+        cancel.request();
+
+        assert!(cancel.remove_dir(&path).is_break());
+        assert!(path.is_dir());
+        fs::remove_dir(&path).unwrap();
+    }
+
+    #[test]
+    fn request_during_final_progress_keeps_the_completed_outcome() {
+        let root = temp_root("late-cancel");
+        let cancel = Cancellation::default();
+        let (_, outcome, _) = sweep_all(
+            std::slice::from_ref(&root),
+            &cancel,
+            SweepLog::disabled(),
+            |_, _, _| cancel.request(),
+            |_| {},
+        );
+
+        assert!(cancel.is_requested());
+        assert_eq!(outcome, SweepOutcome::Completed);
+        fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
     fn subtree_is_never_descended() {
         let root = temp_root("subtree-prune");
         fs::create_dir_all(root.join(".git/objects/aa")).unwrap();
 
         let guard = ExactGuard::with_paths([]);
-        let cancel = AtomicBool::new(false);
+        let cancel = Cancellation::default();
         let roots = [root.clone()];
-        let (stats, _log) = sweep_with_guard(
+        let (stats, _, _log) = sweep_with_guard(
             &roots,
             &guard,
             &cancel,
             Duration::ZERO,
             SweepLog::disabled(),
             |_, _, _| {},
+            &mut |_| {},
         );
 
         assert!(root.join(".git/objects/aa").exists());
@@ -408,6 +527,34 @@ mod tests {
     }
 
     #[test]
+    fn protected_subtrees_are_rejected_even_when_they_are_sweep_targets() {
+        let root = temp_root("protected-target");
+        let protected = root.join(".git");
+        let nested = protected.join("nested");
+        let keep = nested.join("keep");
+        fs::create_dir_all(&keep).unwrap();
+        let cancel = Cancellation::default();
+
+        for target in [&protected, &nested] {
+            let (stats, _, _) = sweep_all(
+                std::slice::from_ref(target),
+                &cancel,
+                SweepLog::disabled(),
+                |_, _, _| {},
+                |_| {},
+            );
+
+            assert_eq!(stats.errors, 1);
+            assert_eq!(stats.deleted, 0);
+            assert!(keep.is_dir());
+        }
+
+        for path in [&keep, &nested, &protected, &root] {
+            fs::remove_dir(path).unwrap();
+        }
+    }
+
+    #[test]
     fn multiple_roots_accumulate_stats() {
         let a = temp_root("multi-a");
         let b = temp_root("multi-b");
@@ -416,15 +563,16 @@ mod tests {
         fs::create_dir_all(b.join("vazia3")).unwrap();
 
         let guard = ExactGuard::with_paths([]);
-        let cancel = AtomicBool::new(false);
+        let cancel = Cancellation::default();
         let roots = [a.clone(), b.clone()];
-        let (stats, _log) = sweep_with_guard(
+        let (stats, _, _log) = sweep_with_guard(
             &roots,
             &guard,
             &cancel,
             Duration::ZERO,
             SweepLog::disabled(),
             |_, _, _| {},
+            &mut |_| {},
         );
 
         // Contadores somam as duas raízes em vez de zerar na segunda.
@@ -467,11 +615,11 @@ mod tests {
         let inner = root.join("alvo-interno");
         fs::create_dir_all(inner.join("vazia")).unwrap();
 
-        let cancel = AtomicBool::new(false);
+        let cancel = Cancellation::default();
         // Usuário selecionou o pai E o filho. O walk roda só o pai, mas o
         // guard tem que conhecer os dois.
         let roots = [root.clone(), inner.clone()];
-        sweep_all(&roots, &cancel, SweepLog::disabled(), |_, _, _| {});
+        sweep_all(&roots, &cancel, SweepLog::disabled(), |_, _, _| {}, |_| {});
 
         assert!(
             !inner.join("vazia").exists(),
@@ -498,15 +646,16 @@ mod tests {
         fs::create_dir_all(&path).unwrap();
 
         let guard = ExactGuard::with_paths([]);
-        let cancel = AtomicBool::new(false);
+        let cancel = Cancellation::default();
         let roots = [deep_root.clone()];
-        let (stats, _log) = sweep_with_guard(
+        let (stats, _, _log) = sweep_with_guard(
             &roots,
             &guard,
             &cancel,
             Duration::ZERO,
             SweepLog::disabled(),
             |_, _, _| {},
+            &mut |_| {},
         );
 
         // Cascata inteira numa passada, sem estourar a pilha. Com quadros
@@ -524,7 +673,7 @@ mod tests {
     fn roots_themselves_are_never_removed() {
         let root = temp_root("root-survives");
         let guard = ExactGuard::new(std::slice::from_ref(&root));
-        let cancel = AtomicBool::new(false);
+        let cancel = Cancellation::default();
         let roots = [root.clone()];
         sweep_with_guard(
             &roots,
@@ -533,6 +682,7 @@ mod tests {
             Duration::ZERO,
             SweepLog::disabled(),
             |_, _, _| {},
+            &mut |_| {},
         );
 
         assert!(root.exists());

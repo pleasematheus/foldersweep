@@ -1,6 +1,6 @@
 [package]
 name = "foldersweep"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2024"
 build = "build.rs"
 description = "Remove pastas vazias dos caminhos que você marcar"

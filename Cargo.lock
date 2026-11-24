@@ -1225,7 +1225,7 @@ checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
 
 [[package]]
 name = "foldersweep"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "chrono",
  "dirs",
