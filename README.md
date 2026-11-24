@@ -1,5 +1,7 @@
 # Folder Sweep
 
+[![Made with Slint](https://raw.githubusercontent.com/slint-ui/slint/v1.17.1/logo/MadeWithSlint-logo-whitebg.png)](https://slint.dev/)
+
 App de janela única para Windows que varre caminhos escolhidos e apaga pastas vazias.
 
 Discos acumulam pastas vazias deixadas por desinstaladores, extração de zip, builds e movimentação de arquivo. O Windows não traz nada que limpe isso, e fazer à mão é inviável porque a vacuidade é **recursiva**: uma pasta que só contém pastas vazias também fica vazia depois que os filhos somem.
@@ -191,4 +193,8 @@ Pendências conhecidas, detalhadas em `openspec/changes/limpar-pastas-vazias/tas
 
 ## Licença
 
-Indefinida. O Slint é triplo-licenciado (GPLv3 / royalty-free / comercial); a royalty-free cobre aplicação desktop, mas as condições precisam ser lidas antes de qualquer distribuição.
+O código do Folder Sweep está sob a licença MIT. [Texto da licença](LICENSE)
+
+O executável para Windows usa o Slint sob a Slint Royalty-free License 2.0. A seção 2(b) permite atribuir o Slint com o selo «Made with Slint» em uma página pública. [Termos do Slint](https://slint.dev/agreements/slint-royalty-free-license.pdf)
+
+Ao distribuir o executável, inclua o arquivo `LICENSE` no pacote. Mantenha o selo visível em uma página pública, de preferência na página de download.

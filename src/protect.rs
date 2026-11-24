@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
+use std::fs::{self, Metadata};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -112,7 +114,7 @@ fn system_roots() -> &'static [PathBuf] {
 
         let mut roots: Vec<PathBuf> = FROM_ENV
             .iter()
-            .filter_map(|key| std::env::var_os(key))
+            .filter_map(std::env::var_os)
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty())
             .collect();
@@ -153,6 +155,43 @@ pub fn is_subtree_protected(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| SPECIAL_NAMES.iter().any(|s| s.eq_ignore_ascii_case(n)))
+}
+
+pub fn validate_sweep_root(root: &Path) -> io::Result<()> {
+    // Verifica os ancestrais antes de consultar um caminho dentro deles.
+    let ancestors: Vec<_> = root.ancestors().collect();
+    for path in ancestors.into_iter().rev() {
+        if is_subtree_protected(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("A pasta {} está protegida.", path.display()),
+            ));
+        }
+        if !is_plain_directory(&fs::symlink_metadata(path)?) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "A varredura requer um diretório comum em {}.",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_plain_directory(metadata: &Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.is_dir() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.is_dir()
+    }
 }
 
 #[cfg(test)]

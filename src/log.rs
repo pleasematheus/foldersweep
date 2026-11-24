@@ -3,7 +3,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::sweep::SweepStats;
+use crate::sweep::{SweepOutcome, SweepStats};
 
 /// Log gravado ao vivo, uma linha por pasta tocada.
 ///
@@ -100,7 +100,7 @@ impl SweepLog {
         mut self,
         stats: SweepStats,
         elapsed: Duration,
-        cancelled: bool,
+        outcome: SweepOutcome,
         now: &str,
     ) -> LogOutcome {
         if let Some(sink) = self.sink.as_mut() {
@@ -109,7 +109,10 @@ impl SweepLog {
                 write!(
                     sink,
                     "{} em: {now}\r\n",
-                    if cancelled { "Cancelado" } else { "Concluído" }
+                    match outcome {
+                        SweepOutcome::Completed => "Concluído",
+                        SweepOutcome::Cancelled => "Cancelado",
+                    }
                 )?;
                 write!(sink, "Duração: {}\r\n", format_elapsed(elapsed))?;
                 write!(
@@ -219,7 +222,12 @@ mod tests {
             deleted: 1,
             errors: 1,
         };
-        let outcome = log.finish(stats, Duration::from_secs(7), false, "2026-08-09 14:36:09");
+        let outcome = log.finish(
+            stats,
+            Duration::from_secs(7),
+            SweepOutcome::Completed,
+            "2026-08-09 14:36:09",
+        );
         assert!(matches!(outcome, LogOutcome::Written(_)));
 
         let content = std::fs::read_to_string(&file).unwrap();
@@ -258,7 +266,7 @@ mod tests {
         log.finish(
             SweepStats::default(),
             Duration::ZERO,
-            true,
+            SweepOutcome::Cancelled,
             "2026-08-09 14:33:09",
         );
 
@@ -275,7 +283,12 @@ mod tests {
         log.record_deleted(Path::new(r"D:\a"));
         log.flush();
 
-        let outcome = log.finish(SweepStats::default(), Duration::ZERO, false, "agora");
+        let outcome = log.finish(
+            SweepStats::default(),
+            Duration::ZERO,
+            SweepOutcome::Completed,
+            "agora",
+        );
         assert!(matches!(outcome, LogOutcome::Disabled));
     }
 
