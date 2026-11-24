@@ -10,7 +10,11 @@ pub struct DiskEntry {
 }
 
 pub fn list_disks() -> Vec<DiskEntry> {
-    Disks::new_with_refreshed_list()
+    let Ok(disks) = Disks::new_with_refreshed_list() else {
+        return Vec::new();
+    };
+
+    disks
         .iter()
         .map(|disk| DiskEntry {
             mount_point: disk.mount_point().to_path_buf(),

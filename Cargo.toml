@@ -1,6 +1,6 @@
 [package]
 name = "foldersweep"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 build = "build.rs"
 description = "Remove pastas vazias dos caminhos que você marcar"
@@ -14,15 +14,15 @@ name = "FolderSweep"
 path = "src/main.rs"
 
 [dependencies]
-slint = { version = "1.17.1", default-features = false, features = ["renderer-software", "backend-winit", "accessibility", "compat-1-2", "system-tray"] }
-sysinfo = "0.39.6"
-dirs = "6.0.0"
-rfd = { version = "0.17.2", default-features = false }
+slint = { version = "1.19.1", default-features = false, features = ["renderer-software", "backend-winit", "accessibility", "compat-1-2", "system-tray"] }
+sysinfo = "0.40.4"
+dirs = "7.0.0"
+rfd = { version = "0.18.0", default-features = false }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
 [build-dependencies]
-slint-build = "1.17.1"
-winresource = "0.1.31"
+slint-build = "1.19.1"
+winresource = "0.1.34"
 
 # Nada aqui altera o conjunto de instruções gerado — quem faz isso é
 # `target-cpu`, em `.cargo/config.toml`. Estas chaves mexem só em tamanho e
