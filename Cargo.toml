@@ -1,9 +1,10 @@
 [package]
 name = "foldersweep"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 build = "build.rs"
 description = "Remove pastas vazias dos caminhos que você marcar"
+license = "MIT"
 
 # O nome do pacote é o da crate, e crate em Rust é minúscula por convenção. O
 # executável não precisa herdar isso: um alvo `[[bin]]` explícito nomeia o
